@@ -9,10 +9,10 @@ from googleapiclient.discovery import build
 
 # --- CONFIGURATION ---
 GITHUB_USERNAME = ""
-GITHUB_TOKEN = ""  
+GITHUB_TOKEN = ""
 TIMEZONE = "UTC"
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-MAX_COMMITS_PER_REPO = 100  
+CALENDAR_ID = ''
 
 # --- GOOGLE AUTH ---
 def authenticate_google():
@@ -21,43 +21,89 @@ def authenticate_google():
     return build('calendar', 'v3', credentials=creds)
 
 # --- GITHUB API ---
-def get_repos(username):
-    url = f"https://api.github.com/users/{username}/repos"
-    response = requests.get(url, auth=(username, GITHUB_TOKEN))
-    return [repo['name'] for repo in response.json() if repo['owner']['login'] == username]
+def get_repos(_):
+    url = "https://api.github.com/user/repos"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    params = {"per_page": 1000, "affiliation": "owner"}
+    response = requests.get(url, headers=headers, params=params)
 
-def get_commits(username, repo):
-    url = f"https://api.github.com/repos/{username}/{repo}/commits"
-    params = {"per_page": MAX_COMMITS_PER_REPO}
-    response = requests.get(url, auth=(username, GITHUB_TOKEN), params=params)
+    try:
+        data = response.json()
+    except Exception as e:
+        print("❌ Error decoding JSON:", e)
+        print("🔁 Response:", response.text)
+        return []
+
+    if response.status_code != 200:
+        print(f"❌ GitHub API error {response.status_code}")
+        print("🔁 Response:", data)
+        return []
+
+    return [repo['full_name'] for repo in data]
+
+def get_commits(_, repo_full_name):
+    print(f"🔍 Sprawdzam repozytorium: {repo_full_name}")
+
+    repo_url = f"https://api.github.com/repos/{repo_full_name}"
+    repo_resp = requests.get(repo_url, auth=(GITHUB_USERNAME, GITHUB_TOKEN))
+    if repo_resp.status_code != 200:
+        print(f"⚠️ Nie udało się pobrać repo: {repo_full_name}")
+        return []
+
+    default_branch = repo_resp.json().get("default_branch", "main")
+    print(f"🔀 Domyślna gałąź: {default_branch}")
+
     commits = []
-    if response.status_code == 200:
-        for item in response.json():
+    page = 1
+    while True:
+        url = f"https://api.github.com/repos/{repo_full_name}/commits"
+        params = {"per_page": 100, "page": page, "sha": default_branch}
+        response = requests.get(url, auth=(GITHUB_USERNAME, GITHUB_TOKEN), params=params)
+
+        if response.status_code != 200:
+            print(f"❌ Błąd przy pobieraniu commitów: {response.status_code}")
+            break
+
+        page_data = response.json()
+        if not page_data:
+            break
+
+        for item in page_data:
             commit_data = item['commit']
-            author = commit_data.get('author', {})
-            if author.get('name') == username or author.get('email') == f"{username}@users.noreply.github.com":
-                commits.append({
-                    "message": commit_data['message'],
-                    "datetime": commit_data['author']['date']
-                })
+            commits.append({
+                "message": commit_data['message'],
+                "datetime": commit_data['author']['date'],
+                "sha": item['sha'],
+                "repo": repo_full_name
+            })
+
+        page += 1
+
     return commits
+
+# --- EVENT TRACKING ---
+def has_been_synced(sha):
+    if not os.path.exists("synced.txt"):
+        return False
+    with open("synced.txt", "r") as f:
+        return sha.strip() in [line.strip() for line in f.readlines()]
+
+def mark_as_synced(sha):
+    with open("synced.txt", "a") as f:
+        f.write(sha.strip() + "\n")
 
 # --- CALENDAR EVENT CREATION ---
 def create_event(service, commit):
     dt = commit['datetime']
-    start = dt
-    end = dt  # no duration, timestamp-only event
-
     event = {
-        'summary': f"GitHub Commit: {commit['message']}",
-        'start': {'dateTime': start, 'timeZone': TIMEZONE},
-        'end': {'dateTime': end, 'timeZone': TIMEZONE},
-        'description': 'Auto-generated from GitHub'
+        'summary': f"GitHub Commit: {commit['message'][:100]}",
+        'start': {'dateTime': dt, 'timeZone': TIMEZONE},
+        'end': {'dateTime': dt, 'timeZone': TIMEZONE},
+        'description': f"Repo: {commit['repo']}\nCommit SHA: {commit['sha']}\nAuto-generated from GitHub"
     }
 
     try:
-        calendar_id = 'd338a544d41a8b9814e215dff15d63d8a590e6978b6df9a40ce1fa605df8cb71@group.calendar.google.com'
-        service.events().insert(calendarId=calendar_id, body=event).execute()
+        service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     except Exception as e:
         print(f"Error creating event: {e}")
 
@@ -71,11 +117,17 @@ def main():
 
     for repo in tqdm(repos, desc="Processing repositories"):
         commits = get_commits(GITHUB_USERNAME, repo)
+        print(f"📄 Repo: {repo} → znaleziono {len(commits)} commitów")
         for commit in commits:
-            create_event(service, commit)
-            time.sleep(0.2)  # optional: avoid quota burst
+            sha = commit.get("sha", None)
+            if not sha:
+                continue
+            if not has_been_synced(sha):
+                create_event(service, commit)
+                mark_as_synced(sha)
+                time.sleep(0.2)
 
-    print("✅ All commits have been added to your calendar.")
+    print("✅ All new commits have been added to your calendar.")
 
 if __name__ == "__main__":
     main()
